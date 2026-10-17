@@ -55,7 +55,7 @@ local cfg = {
   assign = {},      -- assign[storage name] = item id kept in that resource storage
   trash = {},       -- inventories that delete items (e.g. a chute above lava)
   crafter = nil,    -- crafty turtle on the network (e.g. turtle_0): makes ingots from nuggets
-  noCraft = {},     -- noCraft[id] = true: the turtle could not craft this nugget, store it as is
+  noCraft = {},     -- noCraft[id] = time (ms) the turtle failed on this nugget; retried after NOCRAFT_RETRY
   tanks = {},       -- water tanks: water for the basins of types with water = true
   water = 1000,     -- water (mB) kept in each of those basins
   limit = 1000,     -- max items of one type kept in the main storage
@@ -415,9 +415,20 @@ local function isNugget(id)
   return id:match("_nugget$") ~= nil
 end
 
+local NOCRAFT_RETRY = 10 * 60 * 1000 -- a nugget the turtle failed on is tried again after 10 minutes
+
+-- Minutes until a failed nugget is tried again, or nil if it is not blocked
+local function noCraftLeft(id)
+  local t = cfg.noCraft[id]
+  if type(t) ~= "number" then return nil end -- old saves had `true`: try again now
+  local left = NOCRAFT_RETRY - (os.epoch("utc") - t)
+  if left <= 0 then return nil end
+  return math.ceil(left / 60000)
+end
+
 -- Nuggets that go to the turtle instead of a storage
 local function craftable(id)
-  return crafterSet() and isNugget(id) and not cfg.noCraft[id]
+  return crafterSet() and isNugget(id) and not noCraftLeft(id)
 end
 
 -- The resource storage of this item; a free one is assigned on first use:
@@ -638,7 +649,7 @@ local function collectCrafter(main, res, stats)
       -- came back whole: after 3 batches in a row the turtle really can't craft it
       crafter.fails[id] = (crafter.fails[id] or 0) + 1
       if crafter.fails[id] >= 3 then
-        cfg.noCraft[id] = true
+        cfg.noCraft[id] = os.epoch("utc")
         crafter.fails[id] = nil
         saveConfig()
       end
@@ -724,7 +735,13 @@ local function sortResources(main, stats)
   sortMain(main, res, stats)
   tidy(res, stats)
   for id in pairs(cfg.noCraft) do
-    stats.warn[#stats.warn + 1] = "Turtle can't craft " .. id .. " (kept in main, see Retry in menu)"
+    local left = noCraftLeft(id)
+    if left then
+      stats.warn[#stats.warn + 1] = "Turtle can't craft " .. id .. " (trying again in " .. left .. " min)"
+    else
+      cfg.noCraft[id] = nil
+      saveConfig()
+    end
   end
   -- while sorting, "no room" / "full" are expected: only the progress line is shown
   if stats.sortLeft > 0 then
@@ -1239,11 +1256,6 @@ local function menuItems()
 
     { kind = "header", label = "NUGGET CRAFTER  (crafty turtle on the network)" },
     field("Crafter turtle", function() return cfg.crafter or "" end, turtleSetting, true),
-    button("Retry uncraftable nuggets (" .. #keysOf(cfg.noCraft) .. ")", function()
-      cfg.noCraft = {}
-      saveConfig()
-      return "All nuggets go to the turtle again"
-    end),
 
     { kind = "header", label = "WATER TANKS  (water for the zinc basins)" },
     field("Tank from", function() return cfg.tankFrom end, textSetting("tankFrom"), true),
