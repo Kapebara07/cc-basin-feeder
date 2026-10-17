@@ -545,7 +545,7 @@ local BATCH_TIMEOUT = 30 -- seconds without an answer: empty the turtle and star
 
 -- crafter.batch = { id, since } while the turtle works on a batch;
 -- crafter.reset = empty the whole turtle first (after a restart)
-local crafter = { reset = true }
+local crafter = { reset = true, fails = {} } -- fails[id] = batches in a row that came back uncrafted
 
 -- k nuggets of `id` into each grid slot (k <= 64). Returns false if there are fewer than 9.
 local function sendToCrafter(src, id, avail, stats)
@@ -633,9 +633,17 @@ local function collectCrafter(main, res, stats)
   local returned = pullFromTurtle(main, BACK_SLOT)
   stats.crafted = stats.crafted + crafted
   if crafter.batch and (crafted > 0 or returned > 0) then
+    local id = crafter.batch.id
     if crafted == 0 and returned >= 9 then
-      cfg.noCraft[crafter.batch.id] = true
-      saveConfig()
+      -- came back whole: after 3 batches in a row the turtle really can't craft it
+      crafter.fails[id] = (crafter.fails[id] or 0) + 1
+      if crafter.fails[id] >= 3 then
+        cfg.noCraft[id] = true
+        crafter.fails[id] = nil
+        saveConfig()
+      end
+    else
+      crafter.fails[id] = nil
     end
     crafter.batch = nil
   end
