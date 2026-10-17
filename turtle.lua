@@ -62,22 +62,31 @@ end
 
 local crafted = 0
 
+-- All 9 grid slots hold the same number of items (the feeder has finished this batch)
+local function evenGrid()
+  local n = turtle.getItemCount(GRID[1])
+  for _, s in ipairs(GRID) do
+    if turtle.getItemCount(s) ~= n then return false end
+  end
+  return true
+end
+
 -- One step. Returns true if something was done.
 local function step()
-  local filled = gridState()
+  local filled, name, k = gridState()
   if filled == 0 then return false end
   if not outsideEmpty() then return false end -- the feeder has not taken the last result yet
 
-  -- wait until the feeder has finished filling the grid
-  local before = counts()
-  sleep(1)
-  if not same(before, counts()) then return true end
-
-  local name, k
-  filled, name, k = gridState()
-  if filled ~= 9 then -- mixed items or an incomplete grid: give them back
-    clearGrid()
-    return true
+  -- a full, even grid is crafted at once; anything else may still be filling up: wait for it to settle
+  if filled ~= 9 or not evenGrid() then
+    local before = counts()
+    sleep(0.5)
+    if not same(before, counts()) then return true end
+    filled, name, k = gridState()
+    if filled ~= 9 then -- mixed items or an incomplete grid: give them back
+      clearGrid()
+      return true
+    end
   end
   turtle.select(RESULT)
   local ok = turtle.craft(k)

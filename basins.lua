@@ -38,6 +38,9 @@ local STONES = {
   { id = "create:veridium", label = "Veridium" },
   { id = "create:ochrum",   label = "Ochrum" },
 }
+local IS_FEED = {} -- nuggets the basins eat
+for _, t in ipairs(TYPES) do IS_FEED[t.id] = true end
+
 local IS_STONE = {}
 for _, s in ipairs(STONES) do IS_STONE[s.id] = true end
 
@@ -592,8 +595,10 @@ local function feedCrafter(main, res, stats)
       if craftable(id) and sendToCrafter(res[name], id, total, stats) then return end
     end
   end
+  -- main keeps cfg.limit only of the nuggets the basins eat; other nuggets are all crafted
   for id, total in pairs(main.totals) do
-    if craftable(id) and sendToCrafter(main, id, total - cfg.limit, stats) then return end
+    local keep = IS_FEED[id] and cfg.limit or 0
+    if craftable(id) and sendToCrafter(main, id, total - keep, stats) then return end
   end
 end
 
@@ -602,8 +607,6 @@ local function pullFromTurtle(main, slot)
   return (ok and n) or 0
 end
 
--- Takes the ingots and returned nuggets into the main storage. A batch that came back
--- whole (no ingots, 9+ nuggets) = the turtle can't craft that nugget: stored as is from now on.
 -- An empty slot of the main storage (by the snapshot), or nil
 local function freeSlot(main)
   local ok, size = pcall(main.peripheral.size)
@@ -630,23 +633,46 @@ local function takeIngots(main, res, stats)
   return n
 end
 
-local function collectCrafter(main, res, stats)
-  if not crafterSet() then return end
+local CRAFT_POLL = 0.2 -- seconds between looks while the turtle works on a batch
+local CRAFT_IDLE = 2    -- seconds between looks when there is nothing to craft
+
+crafter.total = { toCrafter = 0, crafted = 0 } -- since the program started, for the status screen
+
+local function newStats()
+  return { sorted = 0, trashed = 0, toCrafter = 0, crafted = 0, noRoom = {}, full = {}, warn = {} }
+end
+
+local function resourceSnapshots()
+  local res = {}
+  for _, name in ipairs(cfg.overflow) do
+    res[name] = snapshot(name)
+    if not res[name] then return nil end
+  end
+  return res
+end
+
+-- One step of the crafter. Returns how long to wait before the next one.
+-- A batch that came back whole (no ingots, 9+ nuggets) 3 times in a row = the turtle
+-- can't craft that nugget (tried again after NOCRAFT_RETRY).
+local function craftStep()
+  local main = snapshot(cfg.main)
+  if not main then return CRAFT_IDLE end
   local timedOut = crafter.batch and os.clock() - crafter.batch.since > BATCH_TIMEOUT
   if crafter.reset or timedOut then
     for slot = 1, 16 do pullFromTurtle(main, slot) end
     crafter.reset, crafter.batch = false, nil
-    if timedOut then stats.warn[#stats.warn + 1] = "Turtle did not answer - is it running turtle.lua?" end
-    return
+    crafter.warn = timedOut and "Turtle did not answer - is it running turtle.lua?" or nil
+    return 0
   end
-  for _, slot in ipairs(OUT_SLOTS) do pullFromTurtle(main, slot) end
-  local crafted = takeIngots(main, res, stats)
-  local returned = pullFromTurtle(main, BACK_SLOT)
-  stats.crafted = stats.crafted + crafted
-  if crafter.batch and (crafted > 0 or returned > 0) then
+
+  local st = newStats()
+  if crafter.batch then
+    local crafted = takeIngots(main, crafter.res, st)
+    local returned = pullFromTurtle(main, BACK_SLOT)
+    if crafted == 0 and returned == 0 then return CRAFT_POLL end -- still working
+    for _, slot in ipairs(OUT_SLOTS) do pullFromTurtle(main, slot) end
     local id = crafter.batch.id
     if crafted == 0 and returned >= 9 then
-      -- came back whole: after 3 batches in a row the turtle really can't craft it
       crafter.fails[id] = (crafter.fails[id] or 0) + 1
       if crafter.fails[id] >= 3 then
         cfg.noCraft[id] = os.epoch("utc")
@@ -656,7 +682,34 @@ local function collectCrafter(main, res, stats)
     else
       crafter.fails[id] = nil
     end
-    crafter.batch = nil
+    crafter.batch, crafter.warn = nil, nil
+    crafter.total.crafted = crafter.total.crafted + crafted
+    return 0
+  end
+
+  -- idle: send the next batch
+  local res = resourceSnapshots()
+  if not res then return CRAFT_IDLE end
+  crafter.res = res
+  feedCrafter(main, res, st)
+  crafter.total.toCrafter = crafter.total.toCrafter + st.toCrafter
+  return crafter.batch and 0 or CRAFT_IDLE
+end
+
+-- Runs next to the basin cycle so the turtle gets a new batch as soon as it is done.
+local function crafterLoop()
+  while true do
+    local wait = CRAFT_IDLE
+    if cfg.running and crafterSet() then
+      local ok, r = pcall(craftStep)
+      if ok then
+        wait = r
+      else
+        if r == "Terminated" then error(r, 0) end
+        crafter.warn = "Crafter error: " .. tostring(r)
+      end
+    end
+    sleep(wait)
   end
 end
 
@@ -730,8 +783,6 @@ local function sortResources(main, stats)
     end
   end
   autoAssign(res)
-  collectCrafter(main, res, stats)
-  feedCrafter(main, res, stats)
   sortMain(main, res, stats)
   tidy(res, stats)
   for id in pairs(cfg.noCraft) do
@@ -901,7 +952,8 @@ local function statusLines()
       end
     end
     if crafterSet() then
-      add(("Nuggets to turtle: %d  Crafted: %d"):format(stats.toCrafter, stats.crafted))
+      add(("Turtle: %d nuggets in, %d ingots out"):format(crafter.total.toCrafter, crafter.total.crafted))
+      if crafter.warn then add("! " .. crafter.warn, colours.orange) end
     end
     add(("Water to zinc basins: %d mB"):format(stats.water or 0))
     if cfg.stone then
@@ -1331,7 +1383,7 @@ loadConfig()
 if cfg.running then installStartup() end -- repair autostart if it was deleted
 
 while true do
-  local ok, err = pcall(parallel.waitForAny, workerLoop, uiLoop, monitorLoop)
+  local ok, err = pcall(parallel.waitForAny, workerLoop, uiLoop, monitorLoop, crafterLoop)
   if ok and not cfg.running then break end              -- Exit pressed while stopped
   if not ok and err == "Terminated" and not cfg.running then break end -- Ctrl+T while stopped
   if not ok and err ~= "Terminated" then
