@@ -459,6 +459,40 @@ end
 
 -- Moves `count` items of `id` from `slot` of `src` (a peripheral) into the item's
 -- own storage; what does not fit is deleted. Returns the number of items handled.
+-- Does this resource storage still hold items of other types (= it is being sorted)?
+local function hasForeign(name, res)
+  local mine = cfg.assign[name]
+  for id in pairs(res[name].totals) do
+    if id ~= mine then return true end
+  end
+  return false
+end
+
+-- Gives every free resource storage a type: the item it already holds the most of
+-- (greedy, the biggest pile first). Nuggets never get a storage.
+local function autoAssign(res)
+  local taken = {}
+  for _, id in pairs(cfg.assign) do taken[id] = true end
+  while true do
+    local bestName, bestId, best = nil, nil, 0
+    for _, name in ipairs(cfg.overflow) do
+      if not cfg.assign[name] then
+        for id, total in pairs(res[name].totals) do
+          if total > best and not taken[id] and not isNugget(id) then
+            bestName, bestId, best = name, id, total
+          end
+        end
+      end
+    end
+    if not bestName then return end
+    cfg.assign[bestName] = bestId
+    taken[bestId] = true
+    saveConfig()
+  end
+end
+
+-- What does not fit is deleted only when the storage is full of its own item;
+-- while it still holds other items (being sorted) nothing is deleted, the rest waits in main.
 local function store(src, slot, id, count, res, stats)
   local own = ownStorage(id, res)
   if not own then
@@ -468,7 +502,7 @@ local function store(src, slot, id, count, res, stats)
   local ok, n = pcall(src.pushItems, own, slot, count)
   n = (ok and n) or 0
   stats.sorted = stats.sorted + n
-  if n < count then
+  if n < count and not hasForeign(own, res) then
     n = n + toTrash(src, slot, count - n, stats)
     if n < count then stats.full[id] = true end
   end
@@ -600,23 +634,40 @@ local function collectCrafter(main, res, stats)
   end
 end
 
--- Items lying in the wrong resource storage move to their own one (never deleted here).
+local TIDY_MOVES = 48 -- stacks moved per cycle while sorting (keeps the basins served)
+
+-- Items lying in the wrong resource storage move to their own one; if that one has no room
+-- yet (or the item has no storage), to the main storage for now. Never deleted here.
 -- Nuggets never stay in a resource storage: 9+ that the turtle can craft wait for it
--- (feedCrafter takes them first), everything else goes back to the main storage.
+-- (feedCrafter takes them first), everything else goes to the main storage.
+-- stats.sortLeft = stacks still lying in the wrong place.
 local function tidy(res, stats)
+  local moves = 0
   for _, name in ipairs(cfg.overflow) do
     local snap = res[name]
     for id, slots in pairs(snap.stock) do
-      if isNugget(id) then
-        if not (craftable(id) and snap.totals[id] >= 9) then
-          for _, s in ipairs(slots) do pcall(snap.peripheral.pushItems, cfg.main, s.slot) end
-        end
-      elseif id ~= cfg.assign[name] then
-        local own = ownStorage(id, res)
-        if own and own ~= name then
-          for _, s in ipairs(slots) do
-            local ok, n = pcall(snap.peripheral.pushItems, own, s.slot)
-            stats.sorted = stats.sorted + ((ok and n) or 0)
+      local nuggetWaits = isNugget(id) and craftable(id) and snap.totals[id] >= 9
+      if id ~= cfg.assign[name] and not nuggetWaits then
+        local own = (not isNugget(id)) and ownStorage(id, res) or nil
+        for _, s in ipairs(slots) do
+          if moves >= TIDY_MOVES then
+            stats.sortLeft = stats.sortLeft + 1
+          else
+            moves = moves + 1
+            local n = 0
+            if own and own ~= name then
+              local ok, m = pcall(snap.peripheral.pushItems, own, s.slot)
+              n = (ok and m) or 0
+              stats.sorted = stats.sorted + n
+            end
+            if n < s.count then
+              local ok, m = pcall(snap.peripheral.pushItems, cfg.main, s.slot)
+              m = (ok and m) or 0
+              if n + m < s.count then
+                stats.sortLeft = stats.sortLeft + 1
+                if m == 0 and n == 0 then stats.stuck = true end
+              end
+            end
           end
         end
       end
@@ -641,15 +692,25 @@ local function sortResources(main, stats)
       saveConfig()
     end
   end
+  autoAssign(res)
   collectCrafter(main, res, stats)
   feedCrafter(main, res, stats)
   sortMain(main, res, stats)
   tidy(res, stats)
-  for id in pairs(stats.noRoom) do
-    stats.warn[#stats.warn + 1] = "No free resource storage for " .. id .. " (stays in main)"
-  end
   for id in pairs(cfg.noCraft) do
     stats.warn[#stats.warn + 1] = "Turtle can't craft " .. id .. " (kept in main, see Retry in menu)"
+  end
+  -- while sorting, "no room" / "full" are expected: only the progress line is shown
+  if stats.sortLeft > 0 then
+    if stats.stuck then
+      stats.warn[#stats.warn + 1] = "Sorting paused: main storage is full (no room to move items out)"
+    end
+    return
+  end
+  local noRoom = keysOf(stats.noRoom)
+  if #noRoom > 0 then
+    stats.warn[#stats.warn + 1] = "No storage left for " .. #noRoom .. " item type(s), kept in main: " ..
+      table.concat(noRoom, ", ")
   end
   for id in pairs(stats.full) do
     stats.warn[#stats.warn + 1] = "Storage for " .. id .. " is full - " ..
@@ -662,7 +723,7 @@ local last = { cycle = 0 }
 
 local function doCycle()
   local stats = { fed = 0, collected = 0, stoned = 0, water = 0, warn = {}, short = {},
-    sorted = 0, trashed = 0, toCrafter = 0, crafted = 0, noRoom = {}, full = {} }
+    sorted = 0, trashed = 0, toCrafter = 0, crafted = 0, noRoom = {}, full = {}, sortLeft = 0 }
   local main, gravel = snapshot(cfg.main), snapshot(cfg.gravel)
   if not main or not gravel then
     last.waiting = "Waiting for " .. (main and "gravel" or "main") .. " storage to load: " ..
@@ -792,6 +853,9 @@ local function statusLines()
       end
       add(("Resource storages used: %d/%d"):format(used, #cfg.overflow))
       add(("Sorted: %d  Deleted: %d"):format(stats.sorted, stats.trashed))
+      if stats.sortLeft > 0 then
+        add(("Sorting storages... %d stacks left"):format(stats.sortLeft), colours.yellow)
+      end
     end
     if crafterSet() then
       add(("Nuggets to turtle: %d  Crafted: %d"):format(stats.toCrafter, stats.crafted))
