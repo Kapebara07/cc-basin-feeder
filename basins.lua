@@ -8,8 +8,8 @@
 -- are deleted (pushed into the trash, e.g. a Create chute above lava).
 -- Nuggets are not stored: a crafty turtle on the same wired network turns
 -- them into ingots (the feeder fills its crafting grid directly, the turtle
--- runs turtle.lua as its startup.lua). The ingots go to the main storage and
--- are sorted like everything else.
+-- runs turtle.lua as its startup.lua). Ingots are never kept in the main
+-- storage: all of them go to their own resource storage.
 -- Crimsite, asurine, veridium and ochrum taken out of the basins go to the
 -- stone storage instead (if it is set).
 -- Zinc basins also get water from the water tanks.
@@ -477,9 +477,10 @@ end
 
 -- Everything above cfg.limit of one type leaves the main storage
 -- (nuggets for the turtle are handled by feedCrafter)
+-- Ingots are not kept in main at all: they all go to their resource storage.
 local function sortMain(main, res, stats)
   for id, total in pairs(main.totals) do
-    local excess = total - cfg.limit
+    local excess = total - (id:match("_ingot$") and 0 or cfg.limit)
     if excess > 0 and not craftable(id) then
       for _, s in ipairs(main.stock[id]) do
         if excess <= 0 then break end
@@ -551,7 +552,33 @@ end
 
 -- Takes the ingots and returned nuggets into the main storage. A batch that came back
 -- whole (no ingots, 9+ nuggets) = the turtle can't craft that nugget: stored as is from now on.
-local function collectCrafter(main, stats)
+-- An empty slot of the main storage (by the snapshot), or nil
+local function freeSlot(main)
+  local ok, size = pcall(main.peripheral.size)
+  if not ok or not size then return nil end
+  local used = {}
+  for _, slots in pairs(main.stock) do
+    for _, s in ipairs(slots) do used[s.slot] = true end
+  end
+  for i = 1, size do
+    if not used[i] then return i end
+  end
+end
+
+-- The ingots: the turtle can't be listed, so they are pulled into an empty slot of the main
+-- storage, looked at there and moved on to their own resource storage (deleted if it is full).
+local function takeIngots(main, res, stats)
+  local slot = freeSlot(main)
+  local ok, n = pcall(main.peripheral.pullItems, cfg.crafter, RESULT_SLOT, nil, slot)
+  n = (ok and n) or 0
+  if n > 0 and slot and res then
+    local okD, d = pcall(main.peripheral.getItemDetail, slot)
+    if okD and d then store(main.peripheral, slot, d.name, d.count, res, stats) end
+  end
+  return n
+end
+
+local function collectCrafter(main, res, stats)
   if not crafterSet() then return end
   local timedOut = crafter.batch and os.clock() - crafter.batch.since > BATCH_TIMEOUT
   if crafter.reset or timedOut then
@@ -561,7 +588,7 @@ local function collectCrafter(main, stats)
     return
   end
   for _, slot in ipairs(OUT_SLOTS) do pullFromTurtle(main, slot) end
-  local crafted = pullFromTurtle(main, RESULT_SLOT)
+  local crafted = takeIngots(main, res, stats)
   local returned = pullFromTurtle(main, BACK_SLOT)
   stats.crafted = stats.crafted + crafted
   if crafter.batch and (crafted > 0 or returned > 0) then
@@ -608,7 +635,7 @@ local function sortResources(main, stats)
       return
     end
   end
-  collectCrafter(main, stats)
+  collectCrafter(main, res, stats)
   feedCrafter(main, res, stats)
   sortMain(main, res, stats)
   tidy(res, stats)
