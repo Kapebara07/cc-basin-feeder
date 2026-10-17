@@ -512,17 +512,24 @@ end
 -- Everything above cfg.limit of one type leaves the main storage
 -- (nuggets for the turtle are handled by feedCrafter)
 -- Ingots are not kept in main at all: they all go to their resource storage.
+-- evicted[id] = items moved out to main only to break a deadlock while sorting (see tidy):
+-- they go back to their own storage as soon as it has room, whatever the limit says
+local evicted = {}
+
 local function sortMain(main, res, stats)
   for id, total in pairs(main.totals) do
-    local excess = total - (id:match("_ingot$") and 0 or cfg.limit)
+    local back = math.min(evicted[id] or 0, total)
+    local excess = math.max(total - (id:match("_ingot$") and 0 or cfg.limit), back)
     if excess > 0 and not isNugget(id) then -- nuggets never go to resource storages
+      local done = 0
       for _, s in ipairs(main.stock[id]) do
         if excess <= 0 then break end
         local want = math.min(excess, s.count)
         local n = store(main.peripheral, s.slot, id, want, res, stats)
-        excess = excess - n
+        excess, done = excess - n, done + n
         if n < want then break end
       end
+      if back > 0 then evicted[id] = math.max(0, evicted[id] - done) end
     end
   end
 end
@@ -636,13 +643,14 @@ end
 
 local TIDY_MOVES = 48 -- stacks moved per cycle while sorting (keeps the basins served)
 
--- Items lying in the wrong resource storage move to their own one; if that one has no room
--- yet (or the item has no storage), to the main storage for now. Never deleted here.
--- Nuggets never stay in a resource storage: 9+ that the turtle can craft wait for it
--- (feedCrafter takes them first), everything else goes to the main storage.
+-- Items lying in the wrong resource storage move to their own one. Items without a storage
+-- (and nuggets) go to the main storage. When nothing could move straight home this cycle
+-- (storages full of each other's items), some stacks go to the main storage to make room.
+-- Never deleted here. Nuggets: 9+ that the turtle can craft wait for it (feedCrafter takes them).
 -- stats.sortLeft = stacks still lying in the wrong place.
 local function tidy(res, stats)
-  local moves = 0
+  local moves, movedHome = 0, 0
+  local blocked = {} -- stacks whose own storage had no room
   for _, name in ipairs(cfg.overflow) do
     local snap = res[name]
     for id, slots in pairs(snap.stock) do
@@ -654,24 +662,34 @@ local function tidy(res, stats)
             stats.sortLeft = stats.sortLeft + 1
           else
             moves = moves + 1
-            local n = 0
-            if own and own ~= name then
-              local ok, m = pcall(snap.peripheral.pushItems, own, s.slot)
-              n = (ok and m) or 0
+            local target = (own and own ~= name) and own or cfg.main
+            local ok, n = pcall(snap.peripheral.pushItems, target, s.slot)
+            n = (ok and n) or 0
+            s.count = s.count - n
+            if target == own then
               stats.sorted = stats.sorted + n
+              movedHome = movedHome + n
             end
-            if n < s.count then
-              local ok, m = pcall(snap.peripheral.pushItems, cfg.main, s.slot)
-              m = (ok and m) or 0
-              if n + m < s.count then
-                stats.sortLeft = stats.sortLeft + 1
-                if m == 0 and n == 0 then stats.stuck = true end
-              end
+            if s.count > 0 then
+              stats.sortLeft = stats.sortLeft + 1
+              if target == own then blocked[#blocked + 1] = { snap = snap, slot = s.slot, id = id } end
             end
           end
         end
       end
     end
+  end
+  -- deadlock: everything is full of each other's items -> move some out to main
+  if movedHome == 0 and #blocked > 0 then
+    local outMoved = 0
+    for i = 1, math.min(#blocked, TIDY_MOVES) do
+      local b = blocked[i]
+      local ok, n = pcall(b.snap.peripheral.pushItems, cfg.main, b.slot)
+      n = (ok and n) or 0
+      evicted[b.id] = (evicted[b.id] or 0) + n
+      outMoved = outMoved + n
+    end
+    if outMoved == 0 then stats.stuck = true end
   end
 end
 
