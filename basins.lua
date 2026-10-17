@@ -481,7 +481,7 @@ end
 local function sortMain(main, res, stats)
   for id, total in pairs(main.totals) do
     local excess = total - (id:match("_ingot$") and 0 or cfg.limit)
-    if excess > 0 and not craftable(id) then
+    if excess > 0 and not isNugget(id) then -- nuggets never go to resource storages
       for _, s in ipairs(main.stock[id]) do
         if excess <= 0 then break end
         local want = math.min(excess, s.count)
@@ -601,23 +601,22 @@ local function collectCrafter(main, res, stats)
 end
 
 -- Items lying in the wrong resource storage move to their own one (never deleted here).
--- A few leftover nuggets (fewer than 9) go back to the main storage.
+-- Nuggets never stay in a resource storage: 9+ that the turtle can craft wait for it
+-- (feedCrafter takes them first), everything else goes back to the main storage.
 local function tidy(res, stats)
   for _, name in ipairs(cfg.overflow) do
     local snap = res[name]
     for id, slots in pairs(snap.stock) do
-      if id ~= cfg.assign[name] then
-        if craftable(id) then
-          if snap.totals[id] < 9 then
-            for _, s in ipairs(slots) do pcall(snap.peripheral.pushItems, cfg.main, s.slot) end
-          end
-        else
-          local own = ownStorage(id, res)
-          if own and own ~= name then
-            for _, s in ipairs(slots) do
-              local ok, n = pcall(snap.peripheral.pushItems, own, s.slot)
-              stats.sorted = stats.sorted + ((ok and n) or 0)
-            end
+      if isNugget(id) then
+        if not (craftable(id) and snap.totals[id] >= 9) then
+          for _, s in ipairs(slots) do pcall(snap.peripheral.pushItems, cfg.main, s.slot) end
+        end
+      elseif id ~= cfg.assign[name] then
+        local own = ownStorage(id, res)
+        if own and own ~= name then
+          for _, s in ipairs(slots) do
+            local ok, n = pcall(snap.peripheral.pushItems, own, s.slot)
+            stats.sorted = stats.sorted + ((ok and n) or 0)
           end
         end
       end
@@ -635,12 +634,22 @@ local function sortResources(main, stats)
       return
     end
   end
+  -- a storage that got assigned to nuggets earlier is freed: nuggets are not stored
+  for name, id in pairs(cfg.assign) do
+    if isNugget(id) then
+      cfg.assign[name] = nil
+      saveConfig()
+    end
+  end
   collectCrafter(main, res, stats)
   feedCrafter(main, res, stats)
   sortMain(main, res, stats)
   tidy(res, stats)
   for id in pairs(stats.noRoom) do
     stats.warn[#stats.warn + 1] = "No free resource storage for " .. id .. " (stays in main)"
+  end
+  for id in pairs(cfg.noCraft) do
+    stats.warn[#stats.warn + 1] = "Turtle can't craft " .. id .. " (kept in main, see Retry in menu)"
   end
   for id in pairs(stats.full) do
     stats.warn[#stats.warn + 1] = "Storage for " .. id .. " is full - " ..
