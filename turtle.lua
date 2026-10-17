@@ -1,109 +1,107 @@
--- Nugget crafter for the Basin Feeder. Runs on a crafty turtle (turtle + crafting table).
--- Chest ABOVE the turtle = input: the feeder puts nuggets there (one type, a multiple of 9).
--- Chest BELOW the turtle = output: ingots go there, the feeder sorts them.
--- Nuggets that can't be crafted and small leftovers also go down; the feeder handles them.
--- No fuel needed. Both chests must be on the feeder's network (wired modems).
+-- Nugget crafter for the Basin Feeder. Runs on a crafty turtle (normal or advanced, with a crafting table).
+-- Connect the turtle to the feeder's wired network: a wired modem on the turtle (or a full wired
+-- modem block next to it), right-click the modem. No chests needed, no fuel needed.
+-- The feeder puts nuggets straight into the 3x3 grid (slots 1-3, 5-7, 9-11); the turtle crafts them.
+-- Ingots go to slot 16, nuggets it could not use go to slot 15; the feeder takes both.
 
-local GRID = { 1, 2, 3, 5, 6, 7, 9, 10, 11 }  -- the 3x3 crafting grid
-local SPARE = { 4, 8, 12, 13, 14, 15, 16 }    -- the rest: holds the batch while it is laid out
+local GRID = { 1, 2, 3, 5, 6, 7, 9, 10, 11 }
+local OUTSIDE = { 4, 8, 12, 13, 14, 15, 16 }
+local RESULT, BACK = 16, 15
 
 if not turtle or not turtle.craft then
   printError("This must run on a crafty turtle (turtle with a crafting table).")
   return
 end
 
--- Empties the turtle into the output chest. False if the chest is full.
-local function dropAllDown()
-  for s = 1, 16 do
-    if turtle.getItemCount(s) > 0 then
-      turtle.select(s)
-      if not turtle.dropDown() then return false end
+-- How many grid slots are filled, with which item, smallest stack; "mixed" if types differ
+local function gridState()
+  local name, min, filled = nil, 64, 0
+  for _, s in ipairs(GRID) do
+    local d = turtle.getItemDetail(s)
+    if d then
+      if name and d.name ~= name then return "mixed" end
+      name, filled, min = d.name, filled + 1, math.min(min, d.count)
     end
+  end
+  return filled, name, min
+end
+
+local function counts()
+  local c = {}
+  for s = 1, 16 do c[s] = turtle.getItemCount(s) end
+  return c
+end
+
+local function same(a, b)
+  for s = 1, 16 do
+    if a[s] ~= b[s] then return false end
   end
   return true
 end
 
-local function countIn(slots)
-  local n = 0
-  for _, s in ipairs(slots) do n = n + turtle.getItemCount(s) end
-  return n
+local function outsideEmpty()
+  for _, s in ipairs(OUTSIDE) do
+    if turtle.getItemCount(s) > 0 then return false end
+  end
+  return true
 end
 
--- One batch: take the nuggets, lay them out 3x3, craft, drop the ingots down.
--- Returns false when there was nothing to do.
-local function batch()
-  if not dropAllDown() then return false end -- output chest full: wait
-
-  turtle.select(1)
-  local got = false
-  while turtle.suckUp() do got = true end
-  if not got then return false end
-
-  -- keep one item type; others go back up for the next batch
-  local first
-  for s = 1, 16 do
-    local d = turtle.getItemDetail(s)
-    if d then
-      first = first or d.name
-      if d.name ~= first then
-        turtle.select(s)
-        if not turtle.dropUp() then turtle.dropDown() end
-      end
-    end
-  end
-
-  -- move everything out of the grid into the spare slots
-  for _, g in ipairs(GRID) do
-    for _, s in ipairs(SPARE) do
-      if turtle.getItemCount(g) == 0 then break end
-      turtle.select(g)
-      turtle.transferTo(s)
-    end
-  end
-  -- did not fit (more than 7 stacks): back up
+-- Everything left in the grid goes to BACK (the feeder takes it back)
+local function clearGrid()
   for _, g in ipairs(GRID) do
     if turtle.getItemCount(g) > 0 then
       turtle.select(g)
-      if not turtle.dropUp() then turtle.dropDown() end
+      turtle.transferTo(BACK)
+      for _, s in ipairs({ 14, 13, 12, 8, 4 }) do
+        if turtle.getItemCount(g) == 0 then break end
+        turtle.transferTo(s)
+      end
     end
   end
+end
 
-  local k = math.min(64, math.floor(countIn(SPARE) / 9))
-  if k > 0 then
-    -- k nuggets into every grid slot
-    for _, g in ipairs(GRID) do
-      local need = k
-      for _, s in ipairs(SPARE) do
-        if need == 0 then break end
-        local c = turtle.getItemCount(s)
-        if c > 0 then
-          local t = math.min(c, need)
-          turtle.select(s)
-          turtle.transferTo(g, t)
-          need = need - t
-        end
-      end
-    end
-    -- leftovers (fewer than 9) must not stay outside the grid while crafting
-    for _, s in ipairs(SPARE) do
-      if turtle.getItemCount(s) > 0 then
-        turtle.select(s)
-        turtle.dropDown()
-      end
-    end
-    turtle.select(16)
-    turtle.craft(k)
+local crafted = 0
+
+-- One step. Returns true if something was done.
+local function step()
+  local filled = gridState()
+  if filled == 0 then return false end
+  if not outsideEmpty() then return false end -- the feeder has not taken the last result yet
+
+  -- wait until the feeder has finished filling the grid
+  local before = counts()
+  sleep(1)
+  if not same(before, counts()) then return true end
+
+  local name, k
+  filled, name, k = gridState()
+  if filled ~= 9 then -- mixed items or an incomplete grid: give them back
+    clearGrid()
+    return true
   end
-  dropAllDown()
+  turtle.select(RESULT)
+  local ok = turtle.craft(k)
+  if ok then
+    crafted = crafted + turtle.getItemCount(RESULT)
+    print(("Crafted %d from %s (total %d)"):format(turtle.getItemCount(RESULT), name, crafted))
+  else
+    printError("Can't craft " .. name .. ", giving it back")
+  end
+  clearGrid()
   return true
 end
 
-print("Nugget crafter: chest above = nuggets in, chest below = ingots out")
+print("Nugget crafter ready. Waiting for nuggets from the feeder...")
 while true do
-  local ok, did = pcall(batch)
+  local ok, did = pcall(step)
   if not ok then
     if did == "Terminated" then error(did, 0) end
     printError(did)
   end
-  if not ok or not did then sleep(1) end
+  if not ok or not did then
+    local timer = os.startTimer(2)
+    repeat
+      local event, id = os.pullEvent()
+    until event == "turtle_inventory" or (event == "timer" and id == timer)
+  end
 end

@@ -6,9 +6,10 @@
 -- every item type gets its own resource storage (assigned automatically,
 -- the first free one). When that storage is full, more items of that type
 -- are deleted (pushed into the trash, e.g. a Create chute above lava).
--- Nuggets are not stored: a crafty turtle turns them into ingots
--- (chest above the turtle = input, chest below = output, turtle runs
--- turtle/startup.lua), and the ingots are sorted like everything else.
+-- Nuggets are not stored: a crafty turtle on the same wired network turns
+-- them into ingots (the feeder fills its crafting grid directly, the turtle
+-- runs turtle.lua as its startup.lua). The ingots go to the main storage and
+-- are sorted like everything else.
 -- Crimsite, asurine, veridium and ochrum taken out of the basins go to the
 -- stone storage instead (if it is set).
 -- Zinc basins also get water from the water tanks.
@@ -53,8 +54,7 @@ local cfg = {
   overflow = {},    -- resource storages: one item type each
   assign = {},      -- assign[storage name] = item id kept in that resource storage
   trash = {},       -- inventories that delete items (e.g. a chute above lava)
-  crafterIn = nil,  -- chest above the crafty turtle: nuggets go in here
-  crafterOut = nil, -- chest below the crafty turtle: ingots come out here
+  crafter = nil,    -- crafty turtle on the network (e.g. turtle_0): makes ingots from nuggets
   noCraft = {},     -- noCraft[id] = true: the turtle could not craft this nugget, store it as is
   tanks = {},       -- water tanks: water for the basins of types with water = true
   water = 1000,     -- water (mB) kept in each of those basins
@@ -132,6 +132,19 @@ local function isFluid(name)
   return peripheral.wrap(name).tanks ~= nil
 end
 
+local function isTurtle(name)
+  return peripheral.isPresent(name) and peripheral.getType(name) == "turtle"
+end
+
+local function turtleNames()
+  local names = {}
+  for _, name in ipairs(peripheral.getNames()) do
+    if isTurtle(name) then names[#names + 1] = name end
+  end
+  table.sort(names)
+  return names
+end
+
 local function fluidNames()
   local names = {}
   for _, name in ipairs(peripheral.getNames()) do
@@ -174,7 +187,7 @@ end
 
 local SINGLE_USES = {
   main = "main storage", gravel = "gravel storage", stone = "stone storage",
-  crafterIn = "crafter input chest", crafterOut = "crafter output chest",
+  crafter = "crafter turtle",
 }
 local LIST_USES = {
   basins = "basin list", overflow = "resource storage list", tanks = "water tank list", trash = "trash list",
@@ -265,13 +278,8 @@ local function checkConfig()
   for _, name in ipairs(cfg.trash) do
     if not peripheral.isPresent(name) then problems[#problems + 1] = "trash missing: " .. name end
   end
-  if (cfg.crafterIn == nil) ~= (cfg.crafterOut == nil) then
-    problems[#problems + 1] = "set both crafter chests (input and output) or none"
-  end
-  for _, key in ipairs({ "crafterIn", "crafterOut" }) do
-    if cfg[key] and not peripheral.isPresent(cfg[key]) then
-      problems[#problems + 1] = SINGLE_USES[key] .. " missing: " .. cfg[key]
-    end
+  if cfg.crafter and not isTurtle(cfg.crafter) then
+    problems[#problems + 1] = "crafter turtle missing: " .. cfg.crafter
   end
   for _, name in ipairs(cfg.tanks) do
     if not peripheral.isPresent(name) then problems[#problems + 1] = "water tank missing: " .. name end
@@ -399,10 +407,8 @@ end
 -- there is deleted. Nuggets go to the crafty turtle and come back as ingots.
 ---------------------------------------------------------------------------
 
-local MAX_BATCH = 49 * 9 -- nuggets per turtle batch: the turtle keeps them in its 7 spare slots
-
 local function crafterSet()
-  return cfg.crafterIn ~= nil and cfg.crafterOut ~= nil
+  return cfg.crafter ~= nil
 end
 
 local function isNugget(id)
@@ -486,26 +492,48 @@ local function sortMain(main, res, stats)
   end
 end
 
--- Moves up to `amount` (a multiple of 9) nuggets of `id` from a snapshot into the turtle's input chest
+-- The turtle is used as an inventory over the network (turtles expose their 16 slots).
+-- Grid slots get the nuggets; the turtle crafts, puts the ingots into RESULT_SLOT and
+-- nuggets it could not use into BACK_SLOT. Both are taken into the main storage
+-- (ingots above the limit are then sorted into their own storage like everything else).
+local GRID_SLOTS = { 1, 2, 3, 5, 6, 7, 9, 10, 11 }
+local OUT_SLOTS = { 4, 8, 12, 13, 14 } -- not used by the crafter: anything here is taken out
+local RESULT_SLOT, BACK_SLOT = 16, 15
+local BATCH_TIMEOUT = 30 -- seconds without an answer: empty the turtle and start over
+
+-- crafter.batch = { id, since } while the turtle works on a batch;
+-- crafter.reset = empty the whole turtle first (after a restart)
+local crafter = { reset = true }
+
+-- k nuggets of `id` into each grid slot (k <= 64). Returns false if there are fewer than 9.
 local function sendToCrafter(src, id, avail, stats)
-  local amount = math.min(math.floor(avail / 9) * 9, MAX_BATCH)
-  if amount < 9 then return false end
+  local k = math.min(math.floor(avail / 9), 64)
+  if k < 1 then return false end
   local moved = 0
-  for _, s in ipairs(src.stock[id]) do
-    if moved >= amount then break end
-    local ok, n = pcall(src.peripheral.pushItems, cfg.crafterIn, s.slot, math.min(s.count, amount - moved))
-    moved = moved + ((ok and n) or 0)
+  local stock = src.stock[id]
+  local i = 1
+  for _, g in ipairs(GRID_SLOTS) do
+    local need = k
+    while need > 0 and stock[i] do
+      local s = stock[i]
+      if s.count <= 0 then
+        i = i + 1
+      else
+        local ok, n = pcall(src.peripheral.pushItems, cfg.crafter, s.slot, math.min(need, s.count), g)
+        n = (ok and n) or 0
+        s.count, need, moved = s.count - n, need - n, moved + n
+        if n == 0 then i = i + 1 end
+      end
+    end
   end
   stats.toCrafter = stats.toCrafter + moved
+  if moved > 0 then crafter.batch = { id = id, since = os.clock() } end
   return moved > 0
 end
 
--- One batch at a time: only when the input chest is empty (the turtle took the last one).
--- Nuggets lying in the resource storages first, then the excess in the main storage.
+-- One batch at a time. Nuggets lying in the resource storages first, then the excess in main.
 local function feedCrafter(main, res, stats)
-  if not crafterSet() then return end
-  local input = snapshot(cfg.crafterIn)
-  if not input or next(input.totals) then return end
+  if not crafterSet() or crafter.batch or crafter.reset then return end
   for _, name in ipairs(cfg.overflow) do
     for id, total in pairs(res[name].totals) do
       if craftable(id) and sendToCrafter(res[name], id, total, stats) then return end
@@ -516,29 +544,32 @@ local function feedCrafter(main, res, stats)
   end
 end
 
--- Ingots from the turtle are sorted like everything else. Nuggets that came back:
--- 9 or more = the turtle can't craft them (stored as is from now on),
--- fewer = a leftover, goes back to the main storage.
-local function collectCrafter(res, stats)
+local function pullFromTurtle(main, slot)
+  local ok, n = pcall(main.peripheral.pullItems, cfg.crafter, slot)
+  return (ok and n) or 0
+end
+
+-- Takes the ingots and returned nuggets into the main storage. A batch that came back
+-- whole (no ingots, 9+ nuggets) = the turtle can't craft that nugget: stored as is from now on.
+local function collectCrafter(main, stats)
   if not crafterSet() then return end
-  local out = snapshot(cfg.crafterOut)
-  if not out then return end
-  for id, slots in pairs(out.stock) do
-    local leftover = craftable(id)
-    if leftover and out.totals[id] >= 9 then
-      cfg.noCraft[id] = true
+  local timedOut = crafter.batch and os.clock() - crafter.batch.since > BATCH_TIMEOUT
+  if crafter.reset or timedOut then
+    for slot = 1, 16 do pullFromTurtle(main, slot) end
+    crafter.reset, crafter.batch = false, nil
+    if timedOut then stats.warn[#stats.warn + 1] = "Turtle did not answer - is it running turtle.lua?" end
+    return
+  end
+  for _, slot in ipairs(OUT_SLOTS) do pullFromTurtle(main, slot) end
+  local crafted = pullFromTurtle(main, RESULT_SLOT)
+  local returned = pullFromTurtle(main, BACK_SLOT)
+  stats.crafted = stats.crafted + crafted
+  if crafter.batch and (crafted > 0 or returned > 0) then
+    if crafted == 0 and returned >= 9 then
+      cfg.noCraft[crafter.batch.id] = true
       saveConfig()
-      leftover = false
     end
-    for _, s in ipairs(slots) do
-      if leftover then
-        pcall(out.peripheral.pushItems, cfg.main, s.slot)
-      else
-        if not isNugget(id) then stats.crafted = stats.crafted + s.count end
-        local n = store(out.peripheral, s.slot, id, s.count, res, stats)
-        if n < s.count then pcall(out.peripheral.pushItems, cfg.main, s.slot) end -- keep the output chest free
-      end
-    end
+    crafter.batch = nil
   end
 end
 
@@ -577,7 +608,7 @@ local function sortResources(main, stats)
       return
     end
   end
-  collectCrafter(res, stats)
+  collectCrafter(main, stats)
   feedCrafter(main, res, stats)
   sortMain(main, res, stats)
   tidy(res, stats)
@@ -882,6 +913,7 @@ local function completeNames(text)
   local out = {}
   local all = inventoryNames()
   for _, name in ipairs(fluidNames()) do all[#all + 1] = name end
+  for _, name in ipairs(turtleNames()) do all[#all + 1] = name end
   for _, name in ipairs(all) do
     if #name > #text and name:sub(1, #text) == text then out[#out + 1] = name:sub(#text + 1) end
   end
@@ -987,6 +1019,23 @@ local function storageSetting(key)
   end
 end
 
+local function turtleSetting(value)
+  if value == "" then
+    cfg.crafter = nil
+    saveConfig()
+    return "crafter turtle cleared"
+  end
+  if not isTurtle(value) then
+    local found = turtleNames()
+    return value .. " - not a turtle on the network" ..
+      (#found > 0 and (" (found: " .. table.concat(found, ", ") .. ")") or "")
+  end
+  cfg.crafter = value
+  crafter.reset = true
+  saveConfig()
+  return "crafter turtle set"
+end
+
 local function numberSetting(key, min, max)
   return function(value)
     local n = tonumber(value)
@@ -1062,9 +1111,8 @@ local function menuItems()
     button("Remove trash From..To", function() return removeNames("trash", cfg.trashFrom, cfg.trashTo) end),
     button("Trash list (" .. #cfg.trash .. ")", function() orderPage("trash", "Trash", nil) end),
 
-    { kind = "header", label = "NUGGET CRAFTER  (crafty turtle, makes ingots)" },
-    field("Chest above turtle", function() return cfg.crafterIn or "" end, storageSetting("crafterIn"), true),
-    field("Chest below turtle", function() return cfg.crafterOut or "" end, storageSetting("crafterOut"), true),
+    { kind = "header", label = "NUGGET CRAFTER  (crafty turtle on the network)" },
+    field("Crafter turtle", function() return cfg.crafter or "" end, turtleSetting, true),
     button("Retry uncraftable nuggets (" .. #keysOf(cfg.noCraft) .. ")", function()
       cfg.noCraft = {}
       saveConfig()
